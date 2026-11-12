@@ -16,6 +16,16 @@ elif a[:2] == ["mcp", "remove"]: s.pop(a[-1])
 json.dump(d, open(p, "w"))
 PY
 chmod +x "$T/bin/claude"
+# Fake keychain: like a real Mac with a stale item, only the per-user item (-a $USER)
+# holds the logins; a lookup without -a gets the stale one.
+cat > "$T/bin/security" <<'SH'
+#!/bin/sh
+case "$*" in
+  *"-a $USER"*) echo '{"mcpOAuth":{"figma-personal|abc":{"accessToken":"x"},"figma-work-acme|abc":{}}}' ;;
+  *) echo '{"mcpOAuth":{}}' ;;
+esac
+SH
+chmod +x "$T/bin/security"
 echo '{"mcpServers":{"Figma":{"type":"http","url":"http://127.0.0.1:3845/mcp"}}}' > "$T/home/.claude.json"
 run() { HOME="$T/home" PATH="$T/bin:$PATH" FIGMA_ACCOUNTS_FILE="$T/accounts.json" "$F" "$@"; }
 fail() { echo "FAIL: $*"; exit 1; }
@@ -38,6 +48,8 @@ run remember work-acme "$U" >/dev/null
 grep -q "t=zz" "$T/accounts.json" && fail "query string stored"
 run whois personal me@example.com >/dev/null
 run list | grep -q "figma-personal: .*who: me@example.com" || fail "list shows who"
+run list | grep -q "figma-personal: signed in" || fail "signed-in account shown as signed in"
+run list | grep -q "figma-work-acme: needs sign-in" || fail "account without token shown as needing sign-in"
 run remove work-acme >/dev/null
 run list | grep -q work-acme && fail "remove"
 run which "https://example.com/x" 2>/dev/null; [ $? = 2 ] || fail "non-Figma link exit code"
