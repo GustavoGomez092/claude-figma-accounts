@@ -1,0 +1,207 @@
+#!/usr/bin/env python3
+"""figma-account: connect Claude Code to any number of Figma accounts at once.
+
+Each account is its own copy of Figma's official MCP server (https://mcp.figma.com/mcp),
+registered at user scope as `figma-<name>`. Claude Code keeps one OAuth login per server
+name, so every copy stays signed in to its own Figma account.
+
+  figma-account add <name>              register figma-<name>; then sign in from /mcp
+  figma-account remove <name>           unregister it and drop it from the account list
+  figma-account list                    accounts, signed-in state, who, remembered files
+  figma-account which <figma-url>       print the account that owns this file (exit 1 if unknown)
+  figma-account remember <name> <url>   record that <name> owns this file
+  figma-account whois <name> <text>     note who the account is (e.g. its email)
+
+The account list (accounts.json, next to this script) holds no secrets: names, file keys,
+notes. Tokens stay in Claude Code's keychain entry and are never read out.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+
+URL = "https://mcp.figma.com/mcp"
+PREFIX = "figma-"
+HERE = os.path.dirname(os.path.realpath(__file__))
+REGISTRY = os.environ.get("FIGMA_ACCOUNTS_FILE", os.path.join(HERE, "accounts.json"))
+CLAUDE_JSON = os.path.expanduser("~/.claude.json")
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
+# design/file/board/slides/make/proto/site; for a branch link the main file key is the one
+# that decides access, and it comes first in the path.
+KEY_RE = re.compile(r"figma\.com/(?:design|file|board|slides|make|proto|site)/([A-Za-z0-9]+)")
+
+
+def die(msg, code=2):
+    print(f"figma-account: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def load_registry():
+    try:
+        with open(REGISTRY) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        data = {}
+    data.setdefault("accounts", {})
+    return data
+
+
+def save_registry(data):
+    tmp = REGISTRY + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, REGISTRY)
+
+
+def check_name(name):
+    if name.startswith(PREFIX):
+        name = name[len(PREFIX):]
+    if not NAME_RE.match(name):
+        die(f"bad name {name!r}: use lowercase letters, digits and hyphens (e.g. personal, work-acme)")
+    return name
+
+
+def file_key(url):
+    m = KEY_RE.search(url)
+    if not m:
+        die(f"not a Figma file link: {url}")
+    return m.group(1)
+
+
+def configured():
+    """User-scope servers that point at Figma's remote MCP: {server_name: url}."""
+    try:
+        with open(CLAUDE_JSON) as f:
+            servers = json.load(f).get("mcpServers") or {}
+    except FileNotFoundError:
+        return {}
+    return {n: s.get("url") for n, s in servers.items()
+            if n.startswith(PREFIX) and (s.get("url") or "").rstrip("/") == URL}
+
+
+def signed_in():
+    """Server names that have an OAuth access token stored. Token values are never kept."""
+    try:
+        raw = subprocess.run(
+            ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+            capture_output=True, text=True, check=True).stdout
+        entries = (json.loads(raw).get("mcpOAuth") or {}).values()
+    except (subprocess.CalledProcessError, ValueError, FileNotFoundError):
+        return None  # unknown (no keychain access)
+    return {e.get("serverName") for e in entries if e.get("accessToken")}
+
+
+def claude(*args):
+    r = subprocess.run(["claude", "mcp", *args], capture_output=True, text=True)
+    if r.returncode != 0:
+        die((r.stderr or r.stdout).strip() or f"claude mcp {' '.join(args)} failed")
+    return r.stdout
+
+
+def cmd_add(name):
+    name = check_name(name)
+    server = PREFIX + name
+    if server in configured():
+        print(f"{server} is already registered.")
+    else:
+        claude("add", "--transport", "http", "--scope", "user", server, URL)
+        print(f"Registered {server}.")
+    data = load_registry()
+    data["accounts"].setdefault(name, {"who": "", "files": {}})
+    save_registry(data)
+    print(f"Next: restart Claude Code (a running session only sees servers that existed when it "
+          f"started; `claude --continue` resumes the conversation), then /mcp → {server} → "
+          f"Authenticate with the browser on the Figma account you want for '{name}'. "
+          f"Adding several accounts? Add them all first, then restart once.")
+
+
+def cmd_remove(name):
+    name = check_name(name)
+    server = PREFIX + name
+    if server in configured():
+        claude("remove", "--scope", "user", server)
+        print(f"Unregistered {server}.")
+    data = load_registry()
+    if data["accounts"].pop(name, None) is not None:
+        save_registry(data)
+        print(f"Dropped '{name}' from the account list.")
+
+
+def cmd_list():
+    servers = configured()
+    data = load_registry()
+    tokens = signed_in()
+    names = sorted(set(data["accounts"]) | {s[len(PREFIX):] for s in servers})
+    if not names:
+        print("No Figma accounts yet. Add one: figma-account add <name>")
+        return
+    for name in names:
+        server = PREFIX + name
+        acct = data["accounts"].get(name, {})
+        if server not in servers:
+            state = "NOT REGISTERED (figma-account add " + name + ")"
+        elif tokens is None:
+            state = "registered (sign-in state unknown)"
+        elif server in tokens:
+            state = "signed in"
+        else:
+            state = "needs sign-in (/mcp → " + server + " → Authenticate)"
+        who = f"  who: {acct['who']}" if acct.get("who") else ""
+        print(f"{server}: {state}{who}  files remembered: {len(acct.get('files', {}))}")
+
+
+def cmd_which(url):
+    key = file_key(url)
+    for name, acct in load_registry()["accounts"].items():
+        if key in acct.get("files", {}):
+            print(PREFIX + name)
+            return
+    print(f"unknown file {key}", file=sys.stderr)
+    sys.exit(1)
+
+
+def cmd_remember(name, url):
+    name = check_name(name)
+    key = file_key(url)
+    data = load_registry()
+    if name not in data["accounts"]:
+        die(f"no account '{name}' (figma-account add {name})")
+    for other, acct in data["accounts"].items():
+        if other != name:
+            acct.get("files", {}).pop(key, None)
+    data["accounts"][name].setdefault("files", {})[key] = url.split("?")[0]
+    save_registry(data)
+    print(f"{key} → {PREFIX + name}")
+
+
+def cmd_whois(name, text):
+    name = check_name(name)
+    data = load_registry()
+    if name not in data["accounts"]:
+        die(f"no account '{name}' (figma-account add {name})")
+    data["accounts"][name]["who"] = text
+    save_registry(data)
+    print(f"{PREFIX + name}: {text}")
+
+
+def main(argv):
+    cmds = {"add": (cmd_add, 1), "remove": (cmd_remove, 1), "list": (cmd_list, 0),
+            "which": (cmd_which, 1), "remember": (cmd_remember, 2), "whois": (cmd_whois, None)}
+    if not argv or argv[0] not in cmds:
+        print(__doc__.strip())
+        sys.exit(0 if argv[:1] in ([], ["-h"], ["--help"], ["help"]) else 2)
+    fn, nargs = cmds[argv[0]]
+    args = argv[1:]
+    if fn is cmd_whois:
+        if len(args) < 2:
+            die("usage: figma-account whois <name> <text>")
+        args = [args[0], " ".join(args[1:])]
+    elif len(args) != nargs:
+        die(f"usage: see figma-account --help")
+    fn(*args)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
